@@ -1,0 +1,15 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyCharm / IDE files
+.idea/
+.venv/
+
+# Model weights & Checkpoints
+*.pth
+*.pt
+
+# Output Results folder (Heatmaps, Excel workbooks, counts)
+results/
