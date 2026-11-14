@@ -5,39 +5,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
+import pandas as pd
 
-from config import EPOCHS, RESULT_DIR
-from loss import loss_fn
+from src.config import EPOCHS, RESULT_DIR
+from src.loss import loss_fn
 
 
 def ddp_setup():
-    if "RANK" not in os.environ or "LOCAL_RANK" not in os.environ:
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["LOCAL_RANK"] = "0"
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-
-    if torch.cuda.is_available():
+    # Safely initialize process group only if running via torchrun with CUDA available
+    if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
+        dist.init_process_group(
+            backend="gloo",
+            init_method="env://"
+        )
+        local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
-
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-
-    if not dist.is_initialized():
-        try:
-            dist.init_process_group(backend=backend, init_method="env://")
-        except RuntimeError as e:
-            if "gloo device" in str(e) or "unsupported gloo device" in str(e):
-                print(
-                    "Warning: Distributed process group init failed due to Windows network socket mapping. Falling back to single-device non-DDP mode.")
-                return local_rank
-            else:
-                raise e
-
-    torch.manual_seed(42)
-    return local_rank
+        torch.manual_seed(42)
+        return local_rank
+    else:
+        torch.manual_seed(42)
+        return 0
 
 
 def reduce_tensor(x):
@@ -46,21 +33,16 @@ def reduce_tensor(x):
     return x
 
 
-import pandas as pd
-
-
 def save_cm(y_true, y_pred, classes, title, filename):
-    if len(y_true) == 0:
+    if len(y_true) == 0 or len(classes) == 0:
         return
 
-    # Compute confusion matrix and row-normalized percentages
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=range(len(classes)))
     row_sums = cm.sum(axis=1, keepdims=True)
     cm_pct = (cm.astype(np.float32) / np.where(row_sums == 0, 1, row_sums)) * 100
 
     os.makedirs(RESULT_DIR, exist_ok=True)
 
-    # 1. Save the original heatmap image (.png) safely without text clutter
     plt.figure(figsize=(12, 10))
     sns.heatmap(cm_pct, annot=False, fmt=".1f", cmap="Blues", xticklabels=classes, yticklabels=classes)
     plt.title(title)
@@ -73,7 +55,6 @@ def save_cm(y_true, y_pred, classes, title, filename):
     plt.savefig(os.path.join(RESULT_DIR, filename), dpi=300)
     plt.close()
 
-    # 2. Export detailed tables to Excel (.xlsx) with Raw Counts & Percentage sheets
     df_raw = pd.DataFrame(cm, index=classes, columns=classes)
     df_pct = pd.DataFrame(cm_pct, index=classes, columns=classes).round(2)
 
@@ -84,14 +65,16 @@ def save_cm(y_true, y_pred, classes, title, filename):
         df_raw.to_excel(writer, sheet_name='Raw Counts')
         df_pct.to_excel(writer, sheet_name='Percentage (%)')
 
-def evaluate(model, loader, device, dataset):
+
+def evaluate(model, val_loader, device, dataset):
     model.eval()
-    l1_true, l2_true, l3_true = [], [], []
-    l1_pred, l2_pred, l3_pred = [], [], []
+
+    val_l1_preds, val_l1_true = [], []
+    val_l2_preds, val_l2_true = [], []
+    val_l3_preds, val_l3_true = [], []
 
     with torch.no_grad():
-        for batch in loader:
-            # Handle potential dict vs tuple dataloader batch formats robustly
+        for batch in val_loader:
             if isinstance(batch, dict):
                 x = batch['image']
                 y1 = batch['level1']
@@ -101,61 +84,101 @@ def evaluate(model, loader, device, dataset):
                 x, y1, y2, y3 = batch
 
             x = x.to(device)
+            y1 = y1.to(device)
+            y2 = y2.to(device)
+            y3 = y3.to(device)
+
             out = model(x)
-            p1 = out["level1"].argmax(1)
+            batch_size = x.size(0)
 
-            for i in range(x.size(0)):
-                l1_name = dataset.level1_classes[p1[i].item()]
-                l2_logits = out["level2"][l1_name][i]
-                l2_local = l2_logits.argmax().item()
+            for i in range(batch_size):
+                # Level 1 Evaluation
+                l1_logits = out["level1"][i:i + 1]
+                l1_pred = l1_logits.argmax(1).item()
+                val_l1_preds.append(l1_pred)
+                val_l1_true.append(y1[i].item())
 
+                # Level 2 Evaluation (Mapping local branch predictions back to global indices)
+                l1_name = dataset.level1_classes[y1[i].item()]
+                l2_name = dataset.level2_classes[y2[i].item()]
                 level2_names = list(dataset.hierarchy[l1_name].keys())
-                if l2_local >= len(level2_names):
-                    continue
-                l2_name = level2_names[l2_local]
-                l2_global = dataset.level2_to_idx[l2_name]
 
-                l1_pred.append(p1[i].cpu().item())
-                l2_pred.append(l2_global)
+                if l2_name in level2_names:
+                    l2_logits = out["level2"][l1_name][i:i + 1]
+                    l2_pred_local = l2_logits.argmax(1).item()
 
-                level3_names = dataset.hierarchy[l1_name][l2_name]
+                    predicted_l2_name = level2_names[l2_pred_local]
+                    if predicted_l2_name in dataset.level2_classes:
+                        global_pred_idx = dataset.level2_classes.index(predicted_l2_name)
+                        val_l2_preds.append(global_pred_idx)
+                        val_l2_true.append(y2[i].item())
+
+                # Level 3 Evaluation (Drones branch local binary sub-branches: _FY vs _HO)
+                level3_names = dataset.hierarchy[l1_name].get(l2_name, [])
                 if len(level3_names) > 0:
-                    l3_logits = out["level3"][f"{l1_name}_{l2_name}"][i]
-                    l3_local = l3_logits.argmax().item()
-                    l3_name = level3_names[l3_local]
-                    l3_global = dataset.level3_to_idx[l3_name]
+                    l3_name = dataset.level3_classes[y3[i].item()]
+                    if l3_name in level3_names:
+                        l3_logits = out["level3"][f"{l1_name}_{l2_name}"][i:i + 1]
+                        l3_pred_local = l3_logits.argmax(1).item()
+                        l3_true_local = level3_names.index(l3_name)
 
-                    l3_true.append(y3[i].cpu().item() if torch.is_tensor(y3) else y3[i])
-                    l3_pred.append(l3_global)
+                        val_l3_preds.append(l3_pred_local)
+                        val_l3_true.append(l3_true_local)
 
-            if torch.is_tensor(y1):
-                l1_true.extend(y1.cpu().numpy())
-                l2_true.extend(y2.cpu().numpy())
-            else:
-                l1_true.extend(y1)
-                l2_true.extend(y2)
+    print("\n" + "=" * 40)
+    print("VALIDATION REPORT")
+    print("=" * 40)
 
-    # Print and save Level 1 (Domain)
-    print("\nLEVEL 1 (Domain)")
-    print(classification_report(l1_true, l1_pred, target_names=dataset.level1_classes, zero_division=0))
-    save_cm(l1_true, l1_pred, dataset.level1_classes, "Level 1 Domain Confusion Matrix", "level1_cm.png")
+    print("\nLEVEL 1")
+    print(classification_report(
+        val_l1_true, val_l1_preds,
+        target_names=getattr(dataset, 'level1_classes', None),
+        zero_division=0
+    ))
 
-    # Print and save Level 2 (Subclass)
-    print("\nLEVEL 2 (Subclass)")
-    print(classification_report(l2_true, l2_pred, target_names=dataset.level2_classes, zero_division=0))
-    save_cm(l2_true, l2_pred, dataset.level2_classes, "Level 2 Subclass Confusion Matrix", "level2_cm.png")
+    print("\nLEVEL 2")
+    print(classification_report(
+        val_l2_true, val_l2_preds,
+        target_names=getattr(dataset, 'level2_classes', None),
+        zero_division=0
+    ))
 
-    # Print and save Level 3 (Drone Status)
-    if len(l3_true) > 0:
-        print("\nLEVEL 3 (Drone Status)")
-        print(classification_report(l3_true, l3_pred, target_names=dataset.level3_classes, zero_division=0))
-        save_cm(l3_true, l3_pred, dataset.level3_classes, "Level 3 Status Confusion Matrix", "level3_cm.png")
+    if len(val_l3_true) > 0:
+        print("\nLEVEL 3 (Drones Sub-branches: _FY vs _HO)")
+        print(classification_report(
+            val_l3_true, val_l3_preds,
+            target_names=["_FY", "_HO"],
+            zero_division=0
+        ))
+
+    # Save Confusion Matrices and Excel Reports for all levels
+    save_cm(
+        val_l1_true, val_l1_preds,
+        getattr(dataset, 'level1_classes', [str(i) for i in range(len(set(val_l1_true)))]),
+        "Level 1 CM",
+        "val_level1_cm.png"
+    )
+
+    save_cm(
+        val_l2_true, val_l2_preds,
+        getattr(dataset, 'level2_classes', [str(i) for i in range(len(set(val_l2_true)))]),
+        "Level 2 CM",
+        "val_level2_cm.png"
+    )
+
+    if len(val_l3_true) > 0:
+        save_cm(
+            val_l3_true, val_l3_preds,
+            ["_FY", "_HO"],
+            "Level 3 CM",
+            "val_level3_cm.png"
+        )
 
 
 def train(model, train_loader, val_loader, sampler, device, rank, dataset):
     for epoch in range(EPOCHS):
         if epoch <= 40:
-            LRr = 8e-4
+            LRr = 8e-3
         elif epoch <= 60:
             LRr = 1e-4
         else:
@@ -167,7 +190,6 @@ def train(model, train_loader, val_loader, sampler, device, rank, dataset):
             sampler.set_epoch(epoch)
 
         model.train()
-
         loss_sum = torch.tensor(0.0, device=device)
 
         for batch in train_loader:
@@ -195,13 +217,13 @@ def train(model, train_loader, val_loader, sampler, device, rank, dataset):
 
         reduce_tensor(loss_sum)
 
+        if dist.is_initialized():
+            dist.barrier()
+
         if rank == 0:
             print(f"\nEpoch {epoch + 1}/{EPOCHS}")
             world_size = dist.get_world_size() if dist.is_initialized() else 1
-            print(
-                "Loss:",
-                loss_sum.item() / (len(train_loader) * world_size)
-            )
+            print("Loss:", loss_sum.item() / (len(train_loader) * world_size))
             print("Validation")
 
             eval_model = model.module if hasattr(model, "module") else model

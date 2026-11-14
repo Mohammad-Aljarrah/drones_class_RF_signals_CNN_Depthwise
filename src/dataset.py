@@ -8,6 +8,7 @@ import pandas as pd
 from collections import Counter
 from src.config import RESULT_DIR
 
+
 def export_class_counts(dataset, filename="class_counts.xlsx"):
     """
     Counts total samples per class across Level 1, Level 2, and Level 3,
@@ -35,6 +36,7 @@ def export_class_counts(dataset, filename="class_counts.xlsx"):
 
     print(f"Exported class counts to: {excel_path}")
 
+
 class DroneDataset(Dataset):
     def __init__(self, root):
         self.samples = []
@@ -50,16 +52,16 @@ class DroneDataset(Dataset):
         level3 = {"N/A"}
 
         # ---------------------------------------------------------
-        # DISCOVER ASYMMETRIC TREE
+        # DISCOVER ASYMMETRIC TREE (Sorted for deterministic DDP indexing)
         # ---------------------------------------------------------
-        for l1 in os.listdir(root):
+        for l1 in sorted(os.listdir(root)):
             l1_path = os.path.join(root, l1)
             if not os.path.isdir(l1_path) or l1 not in self.level1_to_idx:
                 continue
 
             self.hierarchy[l1] = {}
 
-            for l2 in os.listdir(l1_path):
+            for l2 in sorted(os.listdir(l1_path)):
                 l2_path = os.path.join(l1_path, l2)
                 if not os.path.isdir(l2_path):
                     continue
@@ -67,7 +69,7 @@ class DroneDataset(Dataset):
                 level2.add(l2)
                 self.hierarchy[l1][l2] = []
 
-                sub_items = os.listdir(l2_path)
+                sub_items = sorted(os.listdir(l2_path))
                 has_l3 = any(os.path.isdir(os.path.join(l2_path, item)) and ("_FY" in item or "_HO" in item) for item in sub_items)
 
                 if has_l3:
@@ -106,7 +108,7 @@ class DroneDataset(Dataset):
                         if not os.path.exists(folder):
                             continue
 
-                        for f in os.listdir(folder):
+                        for f in sorted(os.listdir(folder)):
                             if f.lower().endswith((".jpg", ".jpeg", ".png")):
                                 self.samples.append((
                                     os.path.join(folder, f),
@@ -121,7 +123,7 @@ class DroneDataset(Dataset):
                         continue
 
                     dummy_l3_id = self.level3_to_idx["N/A"]
-                    for f in os.listdir(folder):
+                    for f in sorted(os.listdir(folder)):
                         if f.lower().endswith((".jpg", ".jpeg", ".png")):
                             self.samples.append((
                                 os.path.join(folder, f),

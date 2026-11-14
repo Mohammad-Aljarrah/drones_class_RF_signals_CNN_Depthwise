@@ -1,3 +1,14 @@
+# cd /mnt/c/Users/k67192ma/Desktop/drones_class_RF_signals_CNN_Depthwise-master/drones_class_RF_signals_CNN_Depthwise-master
+#python3 -m venv venv
+#source venv/bin/activate
+#mkdir -p ~/data/drone_project
+#rm -rf ~/data/drone_project
+#cp -r /mnt/c/Users/k67192ma/Desktop/drones_class_RF_signals_CNN_Depthwise-master/drones_class_RF_signals_CNN_Depthwise-master/datasets/full_dataset/* ~/data/drone_project/
+
+#pip install -r requirements.txt
+#torchrun --nproc-per-node=3 main.py
+#python main.py (For CPU training)
+# pkill -f main.py
 import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -11,25 +22,32 @@ from src.models import build_model
 from src.engine import ddp_setup, train, evaluate
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
-    rank = ddp_setup()
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
 
-    # Robust device check: forces CPU if CUDA is unavailable on this machine
-    if torch.cuda.is_available():
+    rank = ddp_setup()
+    is_distributed = dist.is_initialized()
+
+    # Robust device selector: supports multi-GPU DDP, single GPU, and CPU fallback
+    if torch.cuda.is_available() and is_distributed:
         device = torch.device(f"cuda:{rank}")
-        print(f"Using GPU device: cuda:{rank}")
+        print(f"Using DDP GPU device: cuda:{rank}")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        print("Using Single GPU device: cuda:0")
     else:
         device = torch.device("cpu")
         print("No GPU found. Running training on CPU.")
-
-    is_distributed = dist.is_initialized()
 
     print("Initializing dataset...")
     dataset = DroneDataset(DATA_ROOT)
     print(f"Dataset loaded with {len(dataset)} samples.")
 
-    from dataset import export_class_counts
+    from src.dataset import export_class_counts
     export_class_counts(dataset)
+
     train_len = int(0.7 * len(dataset))
     val_len = int(0.15 * len(dataset))
     test_len = len(dataset) - train_len - val_len
@@ -45,7 +63,6 @@ if __name__ == "__main__":
     else:
         sampler = None
 
-    # num_workers=0 ensures safe execution on Windows/CPU environments without deadlocks
     train_loader = DataLoader(
         train_ds,
         batch_size=BATCH,
